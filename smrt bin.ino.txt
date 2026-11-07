@@ -1,0 +1,404 @@
+
+#include <Servo.h>
+#include <SoftwareSerial.h>
+#define P_TRIG 2
+#define P_ECHO 3
+
+#define W_TRIG 4
+#define W_ECHO 5
+
+#define D_TRIG 6
+#define D_ECHO A5
+
+#define LID_SERVO 7
+#define SORT_SERVO 8
+#define BUZZER 9
+
+#define GSM_RX 10
+#define GSM_TX 11
+
+#define MOTOR_IN1 12
+#define MOTOR_IN2 13
+
+#define MOISTURE A0
+#define FLAME A1
+#define PIR A2
+
+#define HOME_LIMIT A3
+#define END_LIMIT A4
+
+Servo lid;
+Servo sorter;
+
+SoftwareSerial gsm(GSM_RX, GSM_TX);
+
+String phoneNumber = "+91XXXXXXXXXX";
+
+const int MOISTURE_LIMIT = 500;
+
+const int PERSON_LIMIT = 20;
+const int FULL_LIMIT = 8;
+
+const int LID_OPEN = 90;
+const int LID_CLOSE = 0;
+
+const int WET_GATE = 40;
+const int DRY_GATE = 140;
+const int GATE_CENTER = 90;
+
+bool lidOpen = false;
+bool fullAlertSent = false;
+bool fireAlertSent = false;
+bool motionAlertSent = false;
+
+unsigned long lastPersonTime = 0;
+
+const unsigned long LID_WAIT = 3000;
+
+long getDistance(int trig, int echo) {
+
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(trig, LOW);
+
+  long duration = pulseIn(echo, HIGH, 30000);
+
+  if (duration == 0) return 999;
+
+  return duration * 0.034 / 2;
+}
+
+void sendSMS(String message) {
+
+  gsm.println("AT");
+  delay(500);
+
+  gsm.println("AT+CMGF=1");
+  delay(500);
+
+  gsm.print("AT+CMGS=\"");
+  gsm.print(phoneNumber);
+  gsm.println("\"");
+
+  delay(1000);
+
+  gsm.print(message);
+
+  delay(500);
+
+  gsm.write(26);
+
+  delay(4000);
+}
+void stopMotor() {
+
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, LOW);
+}
+bool safetyOK() {
+
+  if (digitalRead(FLAME) == LOW) return false;
+
+  if (digitalRead(PIR) == HIGH) return false;
+
+  if (lidOpen) return false;
+
+  return true;
+}
+void fireDetection() {
+
+  if (digitalRead(FLAME) == LOW) {
+
+    stopMotor();
+
+    digitalWrite(BUZZER, HIGH);
+
+    if (!fireAlertSent) {
+
+      sendSMS("EMERGENCY: Fire detected in Smart Bin!");
+
+      fireAlertSent = true;
+    }
+
+  } else {
+
+    if (digitalRead(PIR) == LOW) {
+      digitalWrite(BUZZER, LOW);
+    }
+
+    fireAlertSent = false;
+  }
+}
+
+// ========== PIR DETECTION ==========
+
+void movementDetection() {
+
+  if (digitalRead(PIR) == HIGH) {
+
+    stopMotor();
+
+    if (!motionAlertSent) {
+
+      sendSMS("WARNING: Movement detected inside Smart Bin.");
+
+      motionAlertSent = true;
+    }
+
+  } else {
+
+    motionAlertSent = false;
+  }
+}
+void segregateWaste() {
+
+  int moistureValue = analogRead(MOISTURE);
+
+  delay(300);
+
+  moistureValue = analogRead(MOISTURE);
+
+  if (moistureValue < MOISTURE_LIMIT) {
+    sorter.write(WET_GATE);
+
+    delay(1500);
+
+    sorter.write(GATE_CENTER);
+
+    Serial.println("WET WASTE");
+
+  } else {
+
+    sorter.write(DRY_GATE);
+
+    delay(1500);
+
+    sorter.write(GATE_CENTER);
+
+    Serial.println("DRY WASTE");
+
+    delay(500);
+
+    compressDryWaste();
+  }
+}
+void compressDryWaste() {
+
+  if (!safetyOK()) {
+
+    Serial.println("Compression blocked");
+
+    stopMotor();
+
+    return;
+  }
+  if (digitalRead(HOME_LIMIT) != LOW) {
+
+    Serial.println("Compression not at home position");
+
+    return;
+  }
+
+  Serial.println("DRY WASTE COMPRESSION STARTED");
+
+  unsigned long startTime = millis();
+  digitalWrite(MOTOR_IN1, HIGH);
+  digitalWrite(MOTOR_IN2, LOW);
+
+  while (digitalRead(END_LIMIT) == HIGH) {
+
+    if (!safetyOK() || millis() - startTime > 5000) {
+
+      stopMotor();
+
+      Serial.println("Compression stopped");
+
+      return;
+    }
+
+    delay(10);
+  }
+
+  stopMotor();
+
+  Serial.println("Compression completed");
+
+  delay(500);
+
+  if (!safetyOK()) return;
+  startTime = millis();
+  digitalWrite(MOTOR_IN1, LOW);
+  digitalWrite(MOTOR_IN2, HIGH);
+
+  while (digitalRead(HOME_LIMIT) == HIGH) {
+
+    if (!safetyOK() || millis() - startTime > 5000) {
+
+      stopMotor();
+
+      Serial.println("Return movement stopped");
+
+      return;
+    }
+
+    delay(10);
+  }
+
+  stopMotor();
+
+  Serial.println("Compression mechanism returned home");
+}
+void lidControl() {
+
+  long personDistance = getDistance(P_TRIG, P_ECHO);
+
+  if (personDistance < PERSON_LIMIT) {
+
+    if (!lidOpen) {
+
+      lid.write(LID_OPEN);
+
+      lidOpen = true;
+
+      Serial.println("LID OPEN");
+    }
+
+    lastPersonTime = millis();
+  }
+
+  else if (lidOpen &&
+           millis() - lastPersonTime >= LID_WAIT) {
+
+    lid.write(LID_CLOSE);
+
+    lidOpen = false;
+
+    Serial.println("LID CLOSED");
+
+    delay(500);
+
+    // Read waste at the entry chute
+    segregateWaste();
+  }
+}
+void checkFullLevel() {
+
+  long wetDistance = getDistance(W_TRIG, W_ECHO);
+
+  delay(50);
+
+  long dryDistance = getDistance(D_TRIG, D_ECHO);
+
+  bool wetFull = (wetDistance > 0 &&
+                  wetDistance <= FULL_LIMIT);
+
+  bool dryFull = (dryDistance > 0 &&
+                  dryDistance <= FULL_LIMIT);
+
+  if (wetFull || dryFull) {
+
+    digitalWrite(BUZZER, HIGH);
+
+    if (!fullAlertSent) {
+
+      String message = "SMART BIN SB001 FULL ALERT: ";
+
+      if (wetFull && dryFull) {
+        message += "Wet and dry compartments are full.";
+      }
+
+      else if (wetFull) {
+        message += "Wet compartment is full.";
+      }
+
+      else {
+        message += "Dry compartment is full.";
+      }
+
+      message += " Please arrange waste collection.";
+
+      sendSMS(message);
+
+      fullAlertSent = true;
+    }
+
+  } else {
+
+    // Reset alert after both compartments are emptied
+    if (wetDistance > FULL_LIMIT + 3 &&
+        dryDistance > FULL_LIMIT + 3) {
+
+      fullAlertSent = false;
+    }
+
+    if (digitalRead(FLAME) != LOW &&
+        digitalRead(PIR) == LOW) {
+
+      digitalWrite(BUZZER, LOW);
+    }
+  }
+}
+void setup() {
+
+  Serial.begin(9600);
+  gsm.begin(9600);
+
+  pinMode(P_TRIG, OUTPUT);
+  pinMode(P_ECHO, INPUT);
+
+  pinMode(W_TRIG, OUTPUT);
+  pinMode(W_ECHO, INPUT);
+
+  pinMode(D_TRIG, OUTPUT);
+  pinMode(D_ECHO, INPUT);
+
+  pinMode(FLAME, INPUT);
+  pinMode(PIR, INPUT);
+
+  pinMode(BUZZER, OUTPUT);
+
+  pinMode(MOTOR_IN1, OUTPUT);
+  pinMode(MOTOR_IN2, OUTPUT);
+
+  pinMode(HOME_LIMIT, INPUT_PULLUP);
+  pinMode(END_LIMIT, INPUT_PULLUP);
+
+  stopMotor();
+
+  lid.attach(LID_SERVO);
+  sorter.attach(SORT_SERVO);
+
+  lid.write(LID_CLOSE);
+  sorter.write(GATE_CENTER);
+
+  digitalWrite(BUZZER, LOW);
+
+  Serial.println("SMART BIN SYSTEM READY");
+
+  delay(3000);
+}
+void loop() {
+
+  fireDetection();
+
+  if (digitalRead(FLAME) == LOW) {
+
+    stopMotor();
+
+    delay(100);
+
+    return;
+  }
+
+  movementDetection();
+
+  checkFullLevel();
+
+  lidControl();
+
+  delay(100);
+}
